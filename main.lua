@@ -141,6 +141,29 @@ end
 
 local compile, compile_quote, emit
 
+local function compile_ctx()
+	local ctx = {
+		compile_rules = {};
+		env = setmetatable({}, { __index = _G });
+	}
+	ctx.env.ctx = ctx
+	return ctx
+end
+
+local function default_compile_rules(ctx)
+	table.insert(ctx.compile_rules, compile.string)
+	table.insert(ctx.compile_rules, compile.number)
+	table.insert(ctx.compile_rules, compile['nil'])
+	table.insert(ctx.compile_rules, compile['do'])
+	table.insert(ctx.compile_rules, compile['local'])
+	table.insert(ctx.compile_rules, compile.set)
+	table.insert(ctx.compile_rules, compile.lambda)
+	table.insert(ctx.compile_rules, compile.unquote)
+	table.insert(ctx.compile_rules, compile.quote)
+	table.insert(ctx.compile_rules, compile['.'])
+	table.insert(ctx.compile_rules, compile.call)
+end
+
 function compile_quote(sexp, ctx)
 	if type(sexp) == 'string' then
 		return { 'string', sexp }
@@ -157,80 +180,114 @@ function compile_quote(sexp, ctx)
 	end
 end
 
-function compile(sexp, ctx)
-	if type(sexp) == 'string' then
-		return { 'var', sexp }
-	elseif type(sexp) == 'number' then
-		return { 'num', sexp }
-	elseif sexp == nil then
-		return { 'var', 'nil' }
-	elseif sexp[1] == 'do' then
-		local ir = { 'block' }
-		for i = 2, #sexp do
-			ir[#ir + 1] = compile(sexp[i], ctx)
+compile = setmetatable({
+	string = function(sexp, ctx)
+		if type(sexp) == 'string' then
+			return { 'var', sexp }
 		end
-		return ir
-	elseif sexp[1] == 'local' then
-		local ir = { 'local', {}, {} }
-		for i = 1, #sexp[2] do
-			ir[2][#ir[2] + 1] = compile(sexp[2][i], ctx)
+	end;
+	number = function(sexp, ctx)
+		if type(sexp) == 'number' then
+			return { 'num', sexp }
 		end
-		for i = 3, #sexp do
-			ir[3][#ir[3] + 1] = compile(sexp[i], ctx)
+	end;
+	['nil'] = function(sexp, ctx)
+		if sexp == nil then
+			return { 'var', 'nil' }
 		end
-		return ir
-	elseif sexp[1] == 'set' then
-		local ir = { 'set', {}, {} }
-		for i = 1, #sexp[2] do
-			ir[2][#ir[2] + 1] = compile(sexp[2][i], ctx)
+	end;
+	['do'] = function(sexp, ctx)
+		if sexp[1] == 'do' then
+			local ir = { 'block' }
+			for i = 2, #sexp do
+				ir[#ir + 1] = compile(sexp[i], ctx)
+			end
+			return ir
 		end
-		for i = 3, #sexp do
-			ir[3][#ir[3] + 1] = compile(sexp[i], ctx)
+	end;
+	['local'] = function(sexp, ctx)
+		if sexp[1] == 'local' then
+			local ir = { 'local', {}, {} }
+			for i = 1, #sexp[2] do
+				ir[2][#ir[2] + 1] = compile(sexp[2][i], ctx)
+			end
+			for i = 3, #sexp do
+				ir[3][#ir[3] + 1] = compile(sexp[i], ctx)
+			end
+			return ir
 		end
-		return ir
-	elseif sexp[1] == 'lambda' then
-		local ir = { 'lambda', sexp[2], { 'block' } }
-		for i = 3, #sexp do
-			ir[3][#ir[3] + 1] = compile(sexp[i], ctx)
+	end;
+	set = function(sexp, ctx)
+		if sexp[1] == 'set' then
+			local ir = { 'set', {}, {} }
+			for i = 1, #sexp[2] do
+				ir[2][#ir[2] + 1] = compile(sexp[2][i], ctx)
+			end
+			for i = 3, #sexp do
+				ir[3][#ir[3] + 1] = compile(sexp[i], ctx)
+			end
+			return ir
 		end
-		return ir
-	elseif sexp[1] == 'unquote' then
-		local macros = {}
-		local ir = compile({ 'do', table.unpack(sexp, 2) }, {
-			macros = macros;
-			env = setmetatable({
-				macros = macros;
-			}, { __index = _G });
-		})
-		local src = emit(ir, {
-			type = 'statement';
-			value = true;
-			indent = 0;
-		})
-		print('-- unquote')
-		print(src)
-		print('-- done')
-		local fn, err = load(src, 'unquote', nil, ctx.env)
-		if not fn then
-			error(err)
+	end;
+	lambda = function(sexp, ctx)
+		if sexp[1] == 'lambda' then
+			local ir = { 'lambda', sexp[2], { 'block' } }
+			for i = 3, #sexp do
+				ir[3][#ir[3] + 1] = compile(sexp[i], ctx)
+			end
+			return ir
 		end
-		return compile(fn(), ctx)
-	elseif sexp[1] == 'quote' then
-		return compile_quote(sexp[2], ctx)
-	elseif sexp[1] == '.' then
-		return { '.', compile(sexp[2], ctx), compile(sexp[3], ctx) }
-	elseif ctx.macros[sexp[1]] then
-		return compile(ctx.macros[sexp[1]](table.unpack(sexp, 2)), ctx)
-	elseif #sexp >= 1 then
-		local ir =  { 'call', compile(sexp[1], ctx), {} }
-		for i = 2, #sexp do
-			ir[3][#ir[3] + 1] = compile(sexp[i], ctx)
+	end;
+	unquote = function(sexp, ctx)
+		if sexp[1] == 'unquote' then
+			local ctx = compile_ctx()
+			default_compile_rules(ctx)
+			local ir = compile({ 'do', table.unpack(sexp, 2) }, ctx)
+			local src = emit(ir, {
+				type = 'statement';
+				value = true;
+				indent = 0;
+			})
+			print('-- unquote')
+			print(src)
+			print('-- done')
+			local fn, err = load(src, 'unquote', nil, ctx.env)
+			if not fn then
+				error(err)
+			end
+			return compile(fn(), ctx)
 		end
-		return ir
-	else
+	end;
+	quote = function(sexp, ctx)
+		if sexp[1] == 'quote' then
+			return compile_quote(sexp[2], ctx)
+		end
+	end;
+	['.'] = function(sexp, ctx)
+		if sexp[1] == '.' then
+			return { '.', compile(sexp[2], ctx), compile(sexp[3], ctx) }
+		end
+	end;
+	call = function(sexp, ctx)
+		if #sexp >= 1 then
+			local ir =  { 'call', compile(sexp[1], ctx), {} }
+			for i = 2, #sexp do
+				ir[3][#ir[3] + 1] = compile(sexp[i], ctx)
+			end
+			return ir
+		end
+	end;
+}, {
+	__call = function(self, sexp, ctx)
+		for i = 1, #ctx.compile_rules do
+			local ir = ctx.compile_rules[i](sexp, ctx)
+			if ir then
+				return ir
+			end
+		end
 		error(('bad: %s in %s'):format(pl.pretty.write(sexp), pl.pretty.write(ctx)))
-	end
-end
+	end;
+})
 
 function emit(ir, ctx)
 	if ir[1] == 'call' then
@@ -478,18 +535,7 @@ end
 local code = [========[
 (do
 	(unquote
-		(set ((. macros "unquote_nil")) (lambda (...) (do
-			`(,"unquote" (do ,... nil))
-		)))
 		nil
-	)
-	(unquote
-		(print "test")
-		`(print "hello?")
-	)
-	(unquote_nil
-		(print "test")
-		`(print "hello?")
 	)
 )
 ]========]
@@ -502,13 +548,9 @@ print('sexp', pl.pretty.write(sexp))
 
 local ir
 do
-	local macros = {}
-	ir = compile(sexp, {
-		macros = macros;
-		env = setmetatable({
-			macros = macros;
-		}, { __index = _G });
-	})
+	local ctx = compile_ctx()
+	default_compile_rules(ctx)
+	ir = compile(sexp, ctx)
 end
 print('ir', pl.pretty.write(ir))
 
