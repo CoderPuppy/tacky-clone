@@ -139,153 +139,117 @@ local function parse(str)
 	return nil, str, 'nothing matched'
 end
 
-local compile, compile_quote
+local compile, compile_quote, emit
 
 function compile_quote(sexp, ctx)
 	if type(sexp) == 'string' then
-		return ('%q'):format(sexp)
+		return { 'string', sexp }
 	elseif type(sexp) == 'number' then
-		return tostring(sexp)
+		return { 'number', sexp }
 	elseif sexp[1] == 'unquote' then
-		return compile({ 'do', table.unpack(sexp, 2) }, xtend(ctx, {
-			type = 'expression';
-		}))
+		return compile(sexp[2], ctx)
 	else
-		local out = ''
-		out = out .. '{'
+		local ir = { 'table' }
 		for i = 1, #sexp do
-			if i ~= 1 then
-				out = out .. ', '
-			end
-			out = out .. compile_quote(sexp[i], ctx)
+			ir[#ir + 1] = {{'table', {compile_quote(sexp[i], ctx)}}}
 		end
-		out = out .. '}'
-		return out
+		return { 'call', { '.', { 'call', { 'var', 'require' }, { { 'string', 'pl.array2d' } } }, { 'string', 'flatten' } }, {ir} }
 	end
 end
 
 function compile(sexp, ctx)
-	if type(sexp) == 'string' and ctx.type == 'expression' then
-		return sexp
-	elseif type(sexp) == 'string' and ctx.type == 'statement' and ctx.ret then
-		return ('return %s\n'):format(sexp)
+	if type(sexp) == 'string' then
+		return { 'var', sexp }
 	elseif type(sexp) == 'number' then
-		return tostring(sexp)
-	elseif sexp == nil and ctx.type == 'expression' then
-		return 'nil'
-	elseif sexp == nil and ctx.type == 'statement' then
-		return ''
-	elseif sexp[1] == 'do' and ctx.type == 'statement' then
-		local out = 'do\n'
-		for i = 2, #sexp - 1 do
-			out = out .. compile(sexp[i], xtend(ctx, {
-				ret = false;
-			}))
+		return { 'num', sexp }
+	elseif sexp == nil then
+		return { 'var', 'nil' }
+	elseif sexp[1] == 'do' then
+		local ir = { 'block' }
+		for i = 2, #sexp do
+			ir[#ir + 1] = compile(sexp[i], ctx)
 		end
-		if #sexp > 1 then
-			out = out .. compile(sexp[#sexp], ctx)
-		end
-		out = out .. 'end\n'
-		return out
-	elseif sexp[1] == 'do' and ctx.type == 'expression' then
-		local out = '(function(...)\n'
-		for i = 2, #sexp - 1 do
-			out = out .. compile(sexp[i], xtend(ctx, {
-				type = 'statement';
-				ret = false;
-			}))
-		end
-		if #sexp > 1 then
-			out = out .. compile(sexp[#sexp], xtend(ctx, {
-				type = 'statement';
-				ret = true;
-			}))
-		end
-		out = out .. 'end)(...)'
-		return out
-	elseif sexp[1] == 'define' and ctx.type == 'statement' then
-		return ('local %s = %s\n'):format(sexp[2], compile(sexp[3], xtend(ctx, {
-			type = 'expression';
-		})))
-	elseif sexp[1] == 'lambda' and ctx.type == 'expression' then
-		local out = ''
-		out = out .. 'function('
+		return ir
+	elseif sexp[1] == 'local' then
+		local ir = { 'local', {}, {} }
 		for i = 1, #sexp[2] do
-			if i ~= 1 then
-				out = out .. ', '
-			end
-			out = out .. sexp[2][i]
+			ir[2][#ir[2] + 1] = compile(sexp[2][i], ctx)
 		end
-		out = out .. ')\n'
-		for i = 3, #sexp - 1 do
-			out = out .. compile(sexp[i], xtend(ctx, {
-				type = 'statement';
-				ret = false;
-			}))
+		for i = 3, #sexp do
+			ir[3][#ir[3] + 1] = compile(sexp[i], ctx)
 		end
-		if #sexp > 2 then
-			out = out .. compile(sexp[#sexp], xtend(ctx, {
-				type = 'statement';
-				ret = true;
-			}))
+		return ir
+	elseif sexp[1] == 'set' then
+		local ir = { 'set', {}, {} }
+		for i = 1, #sexp[2] do
+			ir[2][#ir[2] + 1] = compile(sexp[2][i], ctx)
 		end
-		out = out .. 'end'
-		return out
+		for i = 3, #sexp do
+			ir[3][#ir[3] + 1] = compile(sexp[i], ctx)
+		end
+		return ir
+	elseif sexp[1] == 'lambda' then
+		local ir = { 'lambda', sexp[2], { 'block' } }
+		for i = 3, #sexp do
+			ir[3][#ir[3] + 1] = compile(sexp[i], ctx)
+		end
+		return ir
 	elseif sexp[1] == 'unquote' then
 		local macros = {}
-		local src = compile({ 'do', table.unpack(sexp, 2) }, {
-			type = 'statement';
-			ret = true;
+		local ir = compile({ 'do', table.unpack(sexp, 2) }, {
 			macros = macros;
 			env = setmetatable({
 				macros = macros;
 			}, { __index = _G });
 		})
+		local src = emit(ir, {
+			type = 'statement';
+			value = true;
+			indent = 0;
+		})
 		print('-- unquote')
 		print(src)
+		print('-- done')
 		local fn, err = load(src, 'unquote', nil, ctx.env)
 		if not fn then
 			error(err)
 		end
 		return compile(fn(), ctx)
 	elseif sexp[1] == 'quote' then
-		local out = ''
-		if ctx.type == 'statement' and ctx.ret then
-			out = out .. 'return '
-		end
-		out = out .. compile_quote(sexp[2], ctx)
-		if ctx.type == 'statement' then
-			out = out .. '\n'
-		end
-		return out
-	elseif sexp[1] == '.' and ctx.type == 'expression' then
-		return ('%s[%s]'):format(
-			compile(sexp[2], ctx),
-			compile(sexp[3], ctx)
-		)
-	elseif sexp[1] == '.=' and ctx.type == 'statement' then
-		local ctx_ = xtend(ctx, { type = 'expression'; })
-		return ('%s[%s] = %s\n'):format(
-			compile(sexp[2], ctx_),
-			compile(sexp[3], ctx_),
-			compile(sexp[4], ctx_)
-		)
+		return compile_quote(sexp[2], ctx)
+	elseif sexp[1] == '.' then
+		return { '.', compile(sexp[2], ctx), compile(sexp[3], ctx) }
 	elseif ctx.macros[sexp[1]] then
 		return compile(ctx.macros[sexp[1]](table.unpack(sexp, 2)), ctx)
 	elseif #sexp >= 1 then
+		local ir =  { 'call', compile(sexp[1], ctx), {} }
+		for i = 2, #sexp do
+			ir[3][#ir[3] + 1] = compile(sexp[i], ctx)
+		end
+		return ir
+	else
+		error(('bad: %s in %s'):format(pl.pretty.write(sexp), pl.pretty.write(ctx)))
+	end
+end
+
+function emit(ir, ctx)
+	if ir[1] == 'call' then
 		local out = ''
 		if ctx.type == 'statement' and ctx.ret then
 			out = out .. 'return '
 		end
-		out = out .. compile(sexp[1], xtend(ctx, {
+		out = out .. emit(ir[2], xtend(ctx, {
 			type = 'expression';
-		})) .. '('
-		for i = 2, #sexp do
-			if i ~= 2 then
+			value = true;
+		}))
+		out = out .. '('
+		for i = 1, #ir[3] do
+			if i ~= 1 then
 				out = out .. ', '
 			end
-			out = out .. compile(sexp[i], xtend(ctx, {
+			out = out .. emit(ir[3][i], xtend(ctx, {
 				type = 'expression';
+				value = true;
 			}))
 		end
 		out = out .. ')'
@@ -293,23 +257,239 @@ function compile(sexp, ctx)
 			out = out .. '\n'
 		end
 		return out
+	elseif ir[1] == 'var' then
+		if ctx.value then
+			local out = ''
+			if ctx.type == 'statement' then
+				out = out .. 'return '
+			end
+			out = out .. ir[2]
+			if ctx.type == 'statement' then
+				out = out .. ';\n'
+			end
+			return out
+		elseif ctx.type == 'statement' then
+			return ('(function() return %s end)();\n'):format(ir[2])
+		else
+			error('wat')
+		end
+	elseif ir[1] == 'string' then
+		if ctx.value then
+			local out = ''
+			if ctx.type == 'statement' then
+				out = out .. 'return '
+			end
+			out = out .. ('%q'):format(ir[2])
+			if ctx.type == 'statement' then
+				out = out .. ';\n'
+			end
+			return out
+		elseif ctx.type == 'statement' then
+			return ''
+		else
+			error('wat')
+		end
+	elseif ir[1] == 'lambda' then
+		if ctx.value then
+			local out = ''
+			out = out .. 'function('
+			for i = 1, #ir[2] do
+				if i ~= 1 then
+					out = out .. ', '
+				end
+				out = out .. ir[2][i]
+			end
+			out = out .. ');\n'
+			out = out .. emit(ir[3], xtend(ctx, {
+				type = 'statement';
+				value = true;
+				indent = ctx.indent + 1;
+			}))
+			out = out .. 'end'
+			return out
+		elseif ctx.type == 'statement' then
+			return ''
+		else
+			error('wat')
+		end
+	elseif ir[1] == 'set' then
+		local left = ''
+		for i = 1, #ir[2] do
+			if i ~= 1 then
+				left = left .. ', '
+			end
+			left = left .. emit(ir[2][i], xtend(ctx, {
+				type = 'expression';
+				value = true;
+			}))
+		end
+
+		local right = ''
+		for i = 1, #ir[3] do
+			if i ~= 1 then
+				right = right .. ', '
+			end
+			right = right .. emit(ir[3][i], xtend(ctx, {
+				type = 'expression';
+				value = true;
+			}))
+		end
+
+		if ctx.type == 'statement' then
+			if ctx.value then
+				return ('return (function(...) %s = ...; return ... end)(%s);\n'):format(left, right)
+			else
+				return ('%s = %s;\n'):format(left, right)
+			end
+		elseif ctx.type == 'expression' then
+			return ('(function(...) %s = ...; return ... end)(%s)'):format(left, right)
+		else
+			error('wat')
+		end
+	elseif ir[1] == '.' then
+		local out = ''
+		if ctx.type == 'statement' then
+			if not ctx.value then
+				out = out .. '(function() '
+			end
+			out = out .. 'return '
+		end
+		out = out .. emit(ir[2], xtend(ctx, {
+			type = 'expression';
+			value = true;
+		}))
+		out = out .. '['
+		out = out .. emit(ir[3], xtend(ctx, {
+			type = 'expression';
+			value = true;
+		}))
+		out = out .. ']'
+		if ctx.type == 'statement' then
+			if not ctx.value then
+				out = out .. ' end)()'
+			end
+			out = out .. ';\n'
+		end
+		return out
+	elseif ir[1] == 'block' then
+		local out = ''
+		if ctx.type == 'expression' then
+			out = out .. '(function(...)\n'
+		end
+		for i = 2, #ir - 1 do
+			out = out .. emit(ir[i], xtend(ctx, {
+				type = 'statement';
+				value = false;
+			}))
+		end
+		if #ir > 1 then
+			out = out .. emit(ir[#ir], xtend(ctx, {
+				type = 'statement';
+			}))
+		end
+		if ctx.type == 'expression' then
+			if ctx.vararg then
+				out = out .. 'end)(...)'
+			else
+				out = out .. 'end)()'
+			end
+		end
+		return out
+	elseif ir[1] == 'table' then
+		local out = ''
+		if ctx.type == 'statement' then
+			if not ctx.value then
+				out = out .. '(function() '
+			end
+			out = out .. 'return '
+		end
+		out = out .. '{\n'
+		for i = 2, #ir do
+			local entry = ir[i]
+			if #entry == 1 then
+				out = out .. ('%s;\n'):format(
+					emit(entry[1], xtend(ctx, {
+						type = 'expression';
+						value = true;
+					}))
+				)
+			elseif #entry == 2 then
+				out = out .. ('[%s] = %s;\n'):format(
+					emit(entry[1], xtend(ctx, {
+						type = 'expression';
+						value = true;
+					})),
+					emit(entry[2], xtend(ctx, {
+						type = 'expression';
+						value = true;
+					}))
+				)
+			else
+				error('wat')
+			end
+		end
+		out = out .. '}'
+		if ctx.type == 'statement' then
+			if not ctx.value then
+				out = out .. ' end)()'
+			end
+			out = out .. ';\n'
+		end
+		return out
+	elseif ir[1] == 'local' then
+		local left = ''
+		for i = 1, #ir[2] do
+			if i ~= 1 then
+				left = left .. ', '
+			end
+			left = left .. emit(ir[2][i], xtend(ctx, {
+				type = 'expression';
+				value = true;
+			}))
+		end
+
+		local right = ''
+		for i = 1, #ir[3] do
+			if i ~= 1 then
+				right = right .. ', '
+			end
+			right = right .. emit(ir[3][i], xtend(ctx, {
+				type = 'expression';
+				value = true;
+			}))
+		end
+
+		if ctx.type == 'statement' then
+			if ctx.value then
+				return ('local %s = %s;\nreturn %s'):format(left, right, left)
+			else
+				return ('local %s = %s;\n'):format(left, right)
+			end
+		elseif ctx.type == 'value' then
+			return right
+		else
+			error('wat')
+		end
 	else
-		error(('bad: %s in %s'):format(pl.pretty.write(sexp), pl.pretty.write(ctx)))
+		error(('bad: %s in %s'):format(pl.pretty.write(ir), pl.pretty.write(ctx)))
 	end
 end
 
 local code = [========[
 (do
-	,(.= macros "unquote_nil" (lambda (...)
-		(define pl ((require "pl.import_into")))
-		(print ((. (. pl "pretty") "write") `(,...)))
-		(print ((. (. pl "pretty") "write") `(,"unquote" (do ,... nil))))
-		`(,"unquote" (do ,... nil))
-	))
+	(unquote
+		(set ((. macros "unquote_nil")) (lambda (...) (do
+			`(,"unquote" (do ,... nil))
+		)))
+		nil
+	)
+	(unquote
+		(print "test")
+		`(print "hello?")
+	)
 	(unquote_nil
-		(print "a" "b" "c")
-		,(print "shouldn't happen")
-		(print "wat")
+		(print "test")
+		`(print "hello?")
 	)
 )
 ]========]
@@ -318,22 +498,27 @@ local sexp, rest, err = parse(code)
 if not sexp then
 	error(('%s at %q'):format(err, rest))
 end
-print(pl.pretty.write(sexp))
+print('sexp', pl.pretty.write(sexp))
 
-local src
+local ir
 do
 	local macros = {}
-	src = compile(sexp, {
-		type = 'statement';
-		ret = true;
+	ir = compile(sexp, {
 		macros = macros;
 		env = setmetatable({
 			macros = macros;
 		}, { __index = _G });
 	})
-	print('-- final')
-	print(src)
 end
+print('ir', pl.pretty.write(ir))
+
+local src = emit(ir, {
+	type = 'statement';
+	value = true;
+})
+print('-- final')
+print(src)
+print('-- done')
 
 local fn, err = load(src, 'final', nil, { pl = pl })
 if not fn then
