@@ -1,9 +1,22 @@
 local pl = require 'pl.import_into' ()
 
+local old_type = type
+local function type(v)
+	local mt = getmetatable(v)
+	if mt and mt.__type then
+		return mt.__type(v)
+	end
+	return old_type(v)
+end
+
+local types = {}
+
 local function xtend(...)
 	local t = {}
 	for i = 1, select('#', ...) do
-		t = pl.tablex.merge(t, select(i, ...), true)
+		for k, v in pairs(select(i, ...)) do
+			t[k] = v
+		end
 	end
 	return t
 end
@@ -139,178 +152,135 @@ local function parse(str)
 	return nil, str, 'nothing matched'
 end
 
-local compile, compile_quote
-
-function compile_quote(sexp, ctx)
-	if type(sexp) == 'string' then
-		return ('%q'):format(sexp)
-	elseif type(sexp) == 'number' then
-		return tostring(sexp)
-	elseif sexp[1] == 'unquote' then
-		return compile({ 'do', table.unpack(sexp, 2) }, xtend(ctx, {
-			type = 'expression';
-		}))
-	else
-		local out = ''
-		out = out .. '{'
-		for i = 1, #sexp do
-			if i ~= 1 then
-				out = out .. ', '
-			end
-			out = out .. compile_quote(sexp[i], ctx)
-		end
-		out = out .. '}'
-		return out
+local function compile_scope(parent)
+	local scope = {
+		vars = {};
+	}
+	if parent then
+		scope.parent = parent
+		setmetatable(scope.vars, { __index = parent.vars; })
 	end
+
+	return scope
 end
 
-function compile(sexp, ctx)
-	if type(sexp) == 'string' and ctx.type == 'expression' then
-		return sexp
-	elseif type(sexp) == 'string' and ctx.type == 'statement' and ctx.ret then
-		return ('return %s\n'):format(sexp)
-	elseif type(sexp) == 'number' then
-		return tostring(sexp)
-	elseif sexp == nil and ctx.type == 'expression' then
-		return 'nil'
-	elseif sexp == nil and ctx.type == 'statement' then
-		return ''
-	elseif sexp[1] == 'do' and ctx.type == 'statement' then
-		local out = 'do\n'
-		for i = 2, #sexp - 1 do
-			out = out .. compile(sexp[i], xtend(ctx, {
-				ret = false;
-			}))
-		end
-		if #sexp > 1 then
-			out = out .. compile(sexp[#sexp], ctx)
-		end
-		out = out .. 'end\n'
-		return out
-	elseif sexp[1] == 'do' and ctx.type == 'expression' then
-		local out = '(function(...)\n'
-		for i = 2, #sexp - 1 do
-			out = out .. compile(sexp[i], xtend(ctx, {
-				type = 'statement';
-				ret = false;
-			}))
-		end
-		if #sexp > 1 then
-			out = out .. compile(sexp[#sexp], xtend(ctx, {
-				type = 'statement';
-				ret = true;
-			}))
-		end
-		out = out .. 'end)(...)'
-		return out
-	elseif sexp[1] == 'define' and ctx.type == 'statement' then
-		return ('local %s = %s\n'):format(sexp[2], compile(sexp[3], xtend(ctx, {
-			type = 'expression';
-		})))
-	elseif sexp[1] == 'lambda' and ctx.type == 'expression' then
-		local out = ''
-		out = out .. 'function('
-		for i = 1, #sexp[2] do
-			if i ~= 1 then
-				out = out .. ', '
+local function compile_ctx()
+	local ctx = {
+		scope = compile_scope();
+	}
+
+	return ctx
+end
+
+types.var = {}
+local var_id = 0
+local function genvar(ctx, var_)
+	if type(var_) == types.var then
+		return var_, ctx
+	end
+
+	local scope = compile_scope(ctx.scope)
+
+	local var = {
+		name = var_;
+		id = var_id;
+		scope = scope;
+	}
+	var_id = var_id + 1;
+	setmetatable(var, {
+		__type = types.var;
+	})
+	if var_ then
+		scope.vars[var_] = var
+	end
+
+	return var, xtend(ctx, { scope = scope; })
+end
+local function getvar(ctx, var_)
+	if type(var_) == types.var then
+		local sc = ctx.scope
+		while sc ~= var_.scope do
+			sc = sc.parent
+			if not sc then
+				error('not in scope')
 			end
-			out = out .. sexp[2][i]
 		end
-		out = out .. ')\n'
-		for i = 3, #sexp - 1 do
-			out = out .. compile(sexp[i], xtend(ctx, {
-				type = 'statement';
-				ret = false;
-			}))
-		end
-		if #sexp > 2 then
-			out = out .. compile(sexp[#sexp], xtend(ctx, {
-				type = 'statement';
-				ret = true;
-			}))
-		end
-		out = out .. 'end'
-		return out
-	elseif sexp[1] == 'unquote' then
-		local macros = {}
-		local src = compile({ 'do', table.unpack(sexp, 2) }, {
-			type = 'statement';
-			ret = true;
-			macros = macros;
-			env = setmetatable({
-				macros = macros;
-			}, { __index = _G });
-		})
-		print('-- unquote')
-		print(src)
-		local fn, err = load(src, 'unquote', nil, ctx.env)
-		if not fn then
-			error(err)
-		end
-		return compile(fn(), ctx)
-	elseif sexp[1] == 'quote' then
-		local out = ''
-		if ctx.type == 'statement' and ctx.ret then
-			out = out .. 'return '
-		end
-		out = out .. compile_quote(sexp[2], ctx)
-		if ctx.type == 'statement' then
-			out = out .. '\n'
-		end
-		return out
-	elseif sexp[1] == '.' and ctx.type == 'expression' then
-		return ('%s[%s]'):format(
-			compile(sexp[2], ctx),
-			compile(sexp[3], ctx)
-		)
-	elseif sexp[1] == '.=' and ctx.type == 'statement' then
-		local ctx_ = xtend(ctx, { type = 'expression'; })
-		return ('%s[%s] = %s\n'):format(
-			compile(sexp[2], ctx_),
-			compile(sexp[3], ctx_),
-			compile(sexp[4], ctx_)
-		)
-	elseif ctx.macros[sexp[1]] then
-		return compile(ctx.macros[sexp[1]](table.unpack(sexp, 2)), ctx)
-	elseif #sexp >= 1 then
-		local out = ''
-		if ctx.type == 'statement' and ctx.ret then
-			out = out .. 'return '
-		end
-		out = out .. compile(sexp[1], xtend(ctx, {
-			type = 'expression';
-		})) .. '('
+		return var_
+	end
+
+	if ctx.scope.vars[var_] then
+		return ctx.scope.vars[var_]
+	end
+	
+	return var_
+end
+
+local function compile(sexp, ctx)
+	if type(sexp) == 'number' then
+		return { 'number', sexp }, ctx
+	elseif type(sexp) == 'string' then
+		return { 'var', getvar(ctx, sexp) }, ctx
+	elseif sexp[1] == 'do' then
+		local octx = ctx
+		local ir = { 'do' }
 		for i = 2, #sexp do
-			if i ~= 2 then
-				out = out .. ', '
+			ir[#ir + 1], ctx = compile(sexp[i], ctx)
+		end
+		return { 'scope', ir }, xtend(ctx, {
+			scope = octx.scope;
+		})
+	elseif sexp[1] == 'flat-do' then
+		local ir = { 'do' }
+		for i = 2, #sexp do
+			ir[#ir + 1], ctx = compile(sexp[i], ctx)
+		end
+		return ir, ctx
+	elseif sexp[1] == 'define' then
+		local vars = {}
+		if type(sexp[2]) == 'table' then
+			for i = 1, #sexp[2] do
+				vars[#var + 1], ctx = genvar(ctx, sexp[2][i])
 			end
-			out = out .. compile(sexp[i], xtend(ctx, {
-				type = 'expression';
-			}))
+		else
+			vars[1], ctx = genvar(ctx, sexp[2])
 		end
-		out = out .. ')'
-		if ctx.type == 'statement' then
-			out = out .. '\n'
+
+		local vals = {}
+		for i = 3, #sexp do
+			vals[#vals + 1], ctx = compile(sexp[i], ctx)
 		end
-		return out
+
+		return { 'local', vars, vals }, ctx
+	elseif sexp[1] == 'set' then
+		local vars = {}
+		for i = 1, #sexp[2] do
+			vars[#vars + 1], ctx = compile(sexp[2][i], ctx)
+		end
+
+		local vals = {}
+		for i = 3, #sexp do
+			vals[#vals + 1], ctx = compile(sexp[i], ctx)
+		end
+
+		return { 'set', vars, vals }, ctx
+	elseif sexp[1] == 'quote' then
+
+	elseif #sexp >= 1 then
+		local fn; fn, ctx = compile(sexp[1], ctx)
+		local args = {}
+		for i = 2, #sexp do
+			args[#args + 1], ctx = compile(sexp[i], ctx)
+		end
+		return { 'call', fn, args }, ctx
 	else
 		error(('bad: %s in %s'):format(pl.pretty.write(sexp), pl.pretty.write(ctx)))
 	end
 end
 
 local code = [========[
-(do
-	,(.= macros "unquote_nil" (lambda (...)
-		(define pl ((require "pl.import_into")))
-		(print ((. (. pl "pretty") "write") `(,...)))
-		(print ((. (. pl "pretty") "write") `(,"unquote" (do ,... nil))))
-		`(,"unquote" (do ,... nil))
-	))
-	(unquote_nil
-		(print "a" "b" "c")
-		,(print "shouldn't happen")
-		(print "wat")
-	)
+(flat-do
+	(define a 1)
+	(print a)
 )
 ]========]
 
@@ -318,25 +288,8 @@ local sexp, rest, err = parse(code)
 if not sexp then
 	error(('%s at %q'):format(err, rest))
 end
-print(pl.pretty.write(sexp))
+print('sexp: ' .. pl.pretty.write(sexp))
 
-local src
-do
-	local macros = {}
-	src = compile(sexp, {
-		type = 'statement';
-		ret = true;
-		macros = macros;
-		env = setmetatable({
-			macros = macros;
-		}, { __index = _G });
-	})
-	print('-- final')
-	print(src)
-end
-
-local fn, err = load(src, 'final', nil, { pl = pl })
-if not fn then
-	error(err)
-end
-fn()
+local ir, ctx = compile(sexp, compile_ctx())
+print('ir: ' .. pl.pretty.write(ir))
+print('ctx: ' .. pl.pretty.write(ctx))
